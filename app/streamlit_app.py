@@ -1,3 +1,5 @@
+# streamlit_app.py
+
 import streamlit as st
 import tempfile
 import time
@@ -146,9 +148,10 @@ def preprocess_face_for_emotion(roi_bgr: np.ndarray, target_size=(96, 96)) -> np
 
 # ── PROCESSING FUNCTIONS: ENGAGEMENT ────────────────────────────────────────────
 
-def process_video_engagement(path: str) -> pd.DataFrame:
+def process_video_engagement(path: str, frame_skip: int = 1) -> pd.DataFrame:
     """
-    Run frame‐by‐frame inference on a video file using the engagement model.
+    Run frame‐by‐frame inference on a video file using the engagement model,
+    sampling every `frame_skip` frames to speed up processing.
     Returns DataFrame: ['time_sec', 'engagement_idx', 'engagement_lbl'].
     """
     model = load_engagement_model()
@@ -164,26 +167,24 @@ def process_video_engagement(path: str) -> pd.DataFrame:
     progress_bar = st.progress(0.0)
     frame_idx = 0
 
+    # We read frames, but only run inference on every `frame_skip`th frame
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Convert BGR → RGB, transform for AlexNet
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        tensor = engagement_transform(img_rgb).unsqueeze(0)
+        if frame_idx % frame_skip == 0:
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            tensor = engagement_transform(img_rgb).unsqueeze(0)
+            with torch.no_grad():
+                outputs = model(tensor)
+                _, pred = torch.max(outputs, 1)
+                engagement_label = ENGAGEMENT_TYPES[pred.item()]
+                engagement_index = ENGAGEMENT_INDEX_MAP[engagement_label]
 
-        # Inference
-        with torch.no_grad():
-            outputs = model(tensor)
-            _, pred = torch.max(outputs, 1)
-            engagement_label = ENGAGEMENT_TYPES[pred.item()]
-            engagement_index = ENGAGEMENT_INDEX_MAP[engagement_label]
-
-        # Record timestamp / label
-        times.append(frame_idx / fps)
-        idxs.append(engagement_index)
-        lbls.append(engagement_label)
+            times.append(frame_idx / fps)
+            idxs.append(engagement_index)
+            lbls.append(engagement_label)
 
         frame_idx += 1
         if total_frames > 0:
@@ -234,7 +235,6 @@ def process_camera_engagement(num_frames: int = 200, fps_delay: float = 0.03) ->
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             tensor = engagement_transform(img_rgb).unsqueeze(0)
 
-            # Inference
             with torch.no_grad():
                 outputs = model(tensor)
                 _, pred = torch.max(outputs, 1)
@@ -293,10 +293,10 @@ def process_camera_engagement(num_frames: int = 200, fps_delay: float = 0.03) ->
 
 # ── PROCESSING FUNCTIONS: EMOTION ───────────────────────────────────────────────
 
-def process_video_emotion(path: str) -> pd.DataFrame:
+def process_video_emotion(path: str, frame_skip: int = 1) -> pd.DataFrame:
     """
-    Open a video file, detect faces on each frame, classify emotion on the largest face.
-    Returns DataFrame: ['time_sec', 'emotion_idx', 'emotion_lbl'].
+    Open a video file, detect faces on each frame, classify emotion on the largest face,
+    sampling every `frame_skip` frames. Returns DataFrame: ['time_sec', 'emotion_idx', 'emotion_lbl'].
     """
     model = load_keras_emotion_model()
     face_cascade = get_face_cascade()
@@ -318,22 +318,23 @@ def process_video_emotion(path: str) -> pd.DataFrame:
         if not ret:
             break
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.3, minNeighbors=5, minSize=(30, 30)
-        )
+        if frame_idx % frame_skip == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.3, minNeighbors=5, minSize=(30, 30)
+            )
 
-        if len(faces) > 0:
-            x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
-            roi_bgr = frame[y : y + h, x : x + w]
-            face_input = preprocess_face_for_emotion(roi_bgr, target_size=(96, 96))
-            preds = model.predict(face_input, verbose=0)
-            emotion_index = int(np.argmax(preds[0]))
-            emotion_label = EMOTION_LABELS[emotion_index]
+            if len(faces) > 0:
+                x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+                roi_bgr = frame[y : y + h, x : x + w]
+                face_input = preprocess_face_for_emotion(roi_bgr, target_size=(96, 96))
+                preds = model.predict(face_input, verbose=0)
+                emotion_index = int(np.argmax(preds[0]))
+                emotion_label = EMOTION_LABELS[emotion_index]
 
-            times.append(frame_idx / fps)
-            idxs.append(emotion_index)
-            lbls.append(emotion_label)
+                times.append(frame_idx / fps)
+                idxs.append(emotion_index)
+                lbls.append(emotion_label)
 
         frame_idx += 1
         if total_frames > 0:
@@ -444,20 +445,46 @@ Welcome! This app lets you pick **two** different facial analysis models and run
 - 🔵 **Emotion Model** (`best_model.h5`) → classifies each detected face into one of 7 emotions:
   `Angry, Disgusted, Fearful, Happy, Neutral, Sad, Surprised.`
 
-Use the sidebar to select your model and input mode, then watch the real-time charts and final summary.
+Use the sidebar to select a model and input mode. Then you can customize frame sampling or webcam frames before processing.  
+Results include time‐series plots, summary statistics, and raw data download.
 """)
 
-# Sidebar: Model choice & Input mode
+# ── SIDEBAR: Configuration ───────────────────────────────────────────────────────
+
 with st.sidebar:
     st.header("⚙️ Configuration")
+
+    # 1) Choose model
     model_choice = st.radio(
         "Select a model:",
         ("Engagement Model (AlexNet)", "Emotion Model (Keras)")
     )
+
+    # 2) Choose input mode
     input_mode = st.radio(
         "Choose input mode:",
         ("Upload Video File", "Use Webcam Live")
     )
+
+    # 3) If video mode, let user pick frame skip
+    if input_mode == "Upload Video File":
+        st.subheader("🗜️ Video Sampling")
+        frame_skip = st.slider(
+            "Process one frame every N frames:",
+            min_value=1, max_value=10, value=1, step=1,
+            help="Increase N to skip frames and speed up processing"
+        )
+        st.caption("Higher skip = fewer frames processed (faster).")
+
+    # 4) If webcam mode, let user pick number of frames
+    if input_mode == "Use Webcam Live":
+        st.subheader("📷 Webcam Settings")
+        webcam_frames = st.slider(
+            "Number of frames to capture:",
+            min_value=50, max_value=500, value=200, step=50
+        )
+        st.caption("More frames = longer capture but smoother charts.")
+
 
 # ── MAIN WORKFLOW ───────────────────────────────────────────────────────────────
 
@@ -467,7 +494,7 @@ if input_mode == "Upload Video File":
         type=["mp4", "mov", "avi", "mkv"]
     )
     if uploaded_file is not None:
-        # Write the uploaded bytes to a temp .mp4 file
+        # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp.write(uploaded_file.read())
             tmp_path = tmp.name
@@ -475,11 +502,12 @@ if input_mode == "Upload Video File":
         st.info("🔄 Processing uploaded video—please wait…")
 
         if model_choice.startswith("Engagement"):
-            df = process_video_engagement(tmp_path)
+            df = process_video_engagement(tmp_path, frame_skip=frame_skip)
             if df.empty:
                 st.error("⚠️ Engagement processing failed or no frames found.")
             else:
-                st.subheader("⏱️ Engagement Index Over Time (Uploaded Video)")
+                # 1) Time‐series line chart: engagement_idx vs. time_sec
+                st.subheader("⏱️ Engagement Index Over Time (Video)")
                 line_chart = (
                     alt.Chart(df)
                     .mark_line(point=True, color="#1f77b4")
@@ -496,6 +524,7 @@ if input_mode == "Upload Video File":
                 )
                 st.altair_chart(line_chart, use_container_width=True)
 
+                # 2) Final bar chart: counts per label
                 st.subheader("📊 Final Engagement Counts")
                 counts = df["engagement_lbl"].value_counts().reindex(ENGAGEMENT_TYPES, fill_value=0)
                 df_counts = pd.DataFrame({
@@ -515,12 +544,31 @@ if input_mode == "Upload Video File":
                 )
                 st.altair_chart(bar_chart, use_container_width=True)
 
+                # 3) Summary statistics
+                avg_idx = df["engagement_idx"].mean()
+                percent_engaged = (
+                    df["engagement_lbl"].isin(["engaged-negative", "engaged-positive"]).mean() * 100
+                )
+                st.markdown(f"**Average Engagement Index:** {avg_idx:.2f}")
+                st.markdown(f"**% of frames engaged** (neg+pos): {percent_engaged:.1f}%")
+
+                # 4) Download CSV + preview
+                st.download_button(
+                    label="📥 Download Engagement Results as CSV",
+                    data=df.to_csv(index=False),
+                    file_name="engagement_results.csv",
+                    mime="text/csv"
+                )
+                with st.expander("Show raw engagement data"):
+                    st.dataframe(df)
+
         else:  # Emotion Model
-            df = process_video_emotion(tmp_path)
+            df = process_video_emotion(tmp_path, frame_skip=frame_skip)
             if df.empty:
                 st.error("⚠️ Emotion processing failed or no faces detected.")
             else:
-                st.subheader("⏱️ Emotion Index Over Time (Uploaded Video)")
+                # 1) Time‐series line chart: emotion_idx vs. time_sec
+                st.subheader("⏱️ Emotion Index Over Time (Video)")
                 line_chart = (
                     alt.Chart(df)
                     .mark_line(point=True, color="#ff7f0e")
@@ -537,6 +585,7 @@ if input_mode == "Upload Video File":
                 )
                 st.altair_chart(line_chart, use_container_width=True)
 
+                # 2) Final bar chart: counts per emotion
                 st.subheader("📊 Final Emotion Counts")
                 counts = df["emotion_lbl"].value_counts().reindex(EMOTION_LABELS, fill_value=0)
                 df_counts = pd.DataFrame({
@@ -556,11 +605,38 @@ if input_mode == "Upload Video File":
                 )
                 st.altair_chart(bar_chart, use_container_width=True)
 
+                # 3) Summary statistics: distribution + most frequent
+                total = len(df)
+                distribution = (
+                    df["emotion_lbl"].value_counts() / total * 100
+                ).round(1)
+                most_freq = distribution.idxmax()
+                most_pct = distribution.max()
+                st.markdown("**Emotion Distribution (%)**")
+                dist_table = pd.DataFrame({
+                    "emotion": distribution.index,
+                    "percent (%)": distribution.values
+                })
+                st.table(dist_table)
+
+                st.markdown(f"**Most Frequent Emotion:** {most_freq} ({most_pct:.1f}%)")
+
+                # 4) Download CSV + preview
+                st.download_button(
+                    label="📥 Download Emotion Results as CSV",
+                    data=df.to_csv(index=False),
+                    file_name="emotion_results.csv",
+                    mime="text/csv"
+                )
+                with st.expander("Show raw emotion data"):
+                    st.dataframe(df)
+
+
 elif input_mode == "Use Webcam Live":
     st.info("▶️ Click the button below to start webcam capture.")
     if st.button("▶️ Start Webcam"):
         if model_choice.startswith("Engagement"):
-            df = process_camera_engagement(num_frames=200, fps_delay=0.03)
+            df = process_camera_engagement(num_frames=webcam_frames, fps_delay=0.03)
             if df.empty:
                 st.error("⚠️ Engagement webcam processing failed or no frames found.")
             else:
@@ -581,7 +657,7 @@ elif input_mode == "Use Webcam Live":
                 )
                 st.altair_chart(line_chart, use_container_width=True)
 
-                st.subheader("📊 Final Engagement Counts (Webcam Run)")
+                st.subheader("📊 Final Engagement Counts (Webcam)")
                 counts = df["engagement_lbl"].value_counts().reindex(ENGAGEMENT_TYPES, fill_value=0)
                 df_counts = pd.DataFrame({
                     "engagement": counts.index,
@@ -600,8 +676,25 @@ elif input_mode == "Use Webcam Live":
                 )
                 st.altair_chart(bar_chart, use_container_width=True)
 
+                # Summary:
+                avg_idx = df["engagement_idx"].mean()
+                percent_engaged = (
+                    df["engagement_lbl"].isin(["engaged-negative", "engaged-positive"]).mean() * 100
+                )
+                st.markdown(f"**Average Engagement Index:** {avg_idx:.2f}")
+                st.markdown(f"**% of frames engaged** (neg+pos): {percent_engaged:.1f}%")
+
+                st.download_button(
+                    label="📥 Download Engagement (Webcam) Results as CSV",
+                    data=df.to_csv(index=False),
+                    file_name="engagement_webcam_results.csv",
+                    mime="text/csv"
+                )
+                with st.expander("Show raw webcam engagement data"):
+                    st.dataframe(df)
+
         else:  # Emotion Model
-            df = process_camera_emotion(num_frames=200, fps_delay=0.03)
+            df = process_camera_emotion(num_frames=webcam_frames, fps_delay=0.03)
             if df.empty:
                 st.error("⚠️ Emotion webcam processing failed or no faces detected.")
             else:
@@ -622,7 +715,7 @@ elif input_mode == "Use Webcam Live":
                 )
                 st.altair_chart(line_chart, use_container_width=True)
 
-                st.subheader("📊 Final Emotion Counts (Webcam Run)")
+                st.subheader("📊 Final Emotion Counts (Webcam)")
                 counts = df["emotion_lbl"].value_counts().reindex(EMOTION_LABELS, fill_value=0)
                 df_counts = pd.DataFrame({
                     "emotion": counts.index,
@@ -640,3 +733,27 @@ elif input_mode == "Use Webcam Live":
                     .properties(height=350)
                 )
                 st.altair_chart(bar_chart, use_container_width=True)
+
+                # Summary distribution
+                total = len(df)
+                distribution = (df["emotion_lbl"].value_counts() / total * 100).round(1)
+                most_freq = distribution.idxmax()
+                most_pct = distribution.max()
+
+                st.markdown("**Emotion Distribution (%)**")
+                dist_table = pd.DataFrame({
+                    "emotion": distribution.index,
+                    "percent (%)": distribution.values
+                })
+                st.table(dist_table)
+
+                st.markdown(f"**Most Frequent Emotion:** {most_freq} ({most_pct:.1f}%)")
+
+                st.download_button(
+                    label="📥 Download Emotion (Webcam) Results as CSV",
+                    data=df.to_csv(index=False),
+                    file_name="emotion_webcam_results.csv",
+                    mime="text/csv"
+                )
+                with st.expander("Show raw webcam emotion data"):
+                    st.dataframe(df)
