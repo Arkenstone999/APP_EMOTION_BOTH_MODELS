@@ -289,15 +289,12 @@ def preprocess_face_for_emotion(roi_bgr: np.ndarray, target_size=(96, 96)) -> np
 # ── STREAMLIT UI SETUP ─────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Continuous Engagement & Emotion App", layout="wide")
-st.title("🤖 Continuous Engagement & Emotion Detection")
+st.title("Our app for the final project. Emotion detection and RT engagement")
 st.markdown("""
 **Overview**  
-- At the top, you can run a “Single‐Image Engagement Sanity Check.”  
 - Below, choose between the AlexNet‐based Engagement Model or a Keras Emotion Model.  
 - You can either upload a video or run a live webcam.  
 - For Engagement, we display a continuous **1–5** “Engagement Score”  
-  _and then we “zoom” any 4–5 region down onto the full 1–5 range_.  
-  (Internally, we still compute three raw softmax confidences, but they’re hidden.)
 """)
 
 
